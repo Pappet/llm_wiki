@@ -1,0 +1,8 @@
+/venv
+*csv
+.claude/
+.agents/
+.gemini/
+*.sh
+*.log
+.env

@@ -1,0 +1,16 @@
+{
+  "directories": {
+    "raw": "./wiki_input/raw",
+    "processed": "./wiki_input/processed",
+    "wiki": "./wiki_data"
+  },
+  "files": {
+    "system_rules": "./system_rules.md"
+  },
+  "models": {
+    "classification": "minimax/minimax-m2.7",
+    "text_update": "minimax/minimax-m2.7",
+    "vision_update": "google/gemma-4-26b-a4b-it"
+  },
+  "openrouter_url": "https://openrouter.ai/api/v1"
+}
