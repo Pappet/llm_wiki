@@ -10,7 +10,8 @@
   "models": {
     "classification": "minimax/minimax-m2.7",
     "text_update": "minimax/minimax-m2.7",
-    "vision_update": "google/gemma-4-26b-a4b-it"
+    "vision_update": "google/gemma-4-26b-a4b-it",
+    "audio_transcription": "google/gemini-2.5-flash-lite"
   },
   "openrouter_url": "https://openrouter.ai/api/v1"
 }

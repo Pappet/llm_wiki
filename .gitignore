@@ -6,3 +6,7 @@
 *.sh
 *.log
 .env
+*.md
+*.png
+*.jpg
+*.jpeg
