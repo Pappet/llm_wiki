@@ -3,6 +3,8 @@ import json
 import shutil
 import base64
 import logging
+import re
+import difflib
 import requests
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict
@@ -200,11 +202,14 @@ REGELN:
         model = config["models"]["vision_update"]
         try:
             base64_image = encode_image(image_path)
+            ext = image_path.rsplit(".", 1)[-1].lower()
+            mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+            mime_type = mime_map.get(ext, "image/jpeg")
             messages.append({
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "Klassifiziere den Inhalt dieses Bildes für ein technisches Wiki."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
                 ]
             })
         except Exception:
@@ -216,13 +221,20 @@ REGELN:
         logger.warning(f"Klassifizierung fehlgeschlagen für Modell '{model}'. Fallback auf 'allgemein'.")
         return "allgemein"
 
-    topic = raw_content.lower()
+    topic = raw_content.lower().replace(" ", "_").replace("-", "_")
     topic = "".join(c for c in topic if c.isalnum() or c == "_").strip("_")
-    
+
     if not topic:
         logger.warning("KI hat nach der Säuberung einen leeren String zurückgegeben. Fallback auf 'allgemein'.")
         return "allgemein"
-        
+
+    # Fuzzy-Abgleich gegen bestehende Seiten (deterministisch, kein API-Call)
+    if existing_pages:
+        matches = difflib.get_close_matches(topic, existing_pages, n=1, cutoff=0.75)
+        if matches and matches[0] != topic:
+            logger.info(f"Fuzzy-Match: '{topic}' → '{matches[0]}' (bestehende Seite)")
+            topic = matches[0]
+
     logger.info(f"Klassifizierung abgeschlossen: Modell '{model}' wählte Thema '{topic}'.")
     return topic
 
@@ -254,7 +266,8 @@ def process_batch():
                 logger.info(f"Datei '{file}' -> Thema: '{topic}'")
             except Exception as e:
                 logger.error(f"Fehler beim Einlesen der Text/Markdown-Datei {file}: {e}")
-                
+                continue
+
         elif ext in ['jpg', 'jpeg', 'png', 'webp']:
             topic = classify_content(image_path=filepath, existing_pages=existing_pages)
             topics[topic]["images"].append(filepath)
@@ -262,6 +275,11 @@ def process_batch():
             logger.info(f"Bilddatei '{file}' -> Thema: '{topic}'")
         else:
             logger.warning(f"Ignoriere Datei '{file}': Nicht unterstütztes Format.")
+            continue
+
+        if topic not in existing_pages:
+            existing_pages.append(topic)
+            logger.debug(f"Neues Thema '{topic}' zum laufenden Index hinzugefügt.")
 
     # 2. Wiki-Seiten generieren/updaten
     for topic, data in topics.items():
@@ -306,9 +324,12 @@ def process_batch():
             for img_path in data["images"]:
                 try:
                     base64_image = encode_image(img_path)
+                    ext = img_path.rsplit(".", 1)[-1].lower()
+                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+                    mime_type = mime_map.get(ext, "image/jpeg")
                     user_content.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                        "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}
                     })
                 except Exception as e:
                     logger.error(f"Bild {img_path} konnte nicht für die API vorbereitet werden und wird übersprungen.")
@@ -336,10 +357,8 @@ def process_batch():
             logger.error(f"Fehler: Modell '{model_to_use}' hat keine gültigen Daten geliefert. Überspringe Update für {topic}.md")
             continue
             
-        if new_wiki_content.startswith("```markdown"):
-            new_wiki_content = new_wiki_content[11:-3]
-        elif new_wiki_content.startswith("```"):
-            new_wiki_content = new_wiki_content[3:-3]
+        new_wiki_content = re.sub(r'^```[a-zA-Z]*\n?', '', new_wiki_content)
+        new_wiki_content = re.sub(r'\n?```\s*$', '', new_wiki_content)
 
         try:
             with open(wiki_file, "w", encoding="utf-8") as f:

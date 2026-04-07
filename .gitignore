@@ -10,3 +10,5 @@
 *.png
 *.jpg
 *.jpeg
+.obsidian/
+seen_urls.json

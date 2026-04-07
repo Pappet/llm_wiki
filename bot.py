@@ -49,6 +49,30 @@ DIRS = config["directories"]
 RAW_DIR = DIRS["raw"]
 os.makedirs(RAW_DIR, exist_ok=True)
 
+_raw_ids = os.getenv("ALLOWED_CHANNEL_IDS", "")
+ALLOWED_CHANNEL_IDS = set(int(cid.strip()) for cid in _raw_ids.split(",") if cid.strip())
+
+# URL-Deduplizierung
+SEEN_URLS_FILE = os.path.join(os.path.dirname(RAW_DIR), "seen_urls.json")
+
+def _load_seen_urls():
+    if os.path.exists(SEEN_URLS_FILE):
+        try:
+            with open(SEEN_URLS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+def _save_seen_urls(seen: set):
+    try:
+        with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(seen), f)
+    except Exception as e:
+        logger.error(f"Fehler beim Speichern der seen_urls: {e}")
+
+SEEN_URLS = _load_seen_urls()
+
 # Discord Setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -151,6 +175,9 @@ async def on_message(message):
     if message.author == client.user:
         return
 
+    if ALLOWED_CHANNEL_IDS and message.channel.id not in ALLOWED_CHANNEL_IDS:
+        return
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     content_saved = False
 
@@ -159,15 +186,22 @@ async def on_message(message):
     if urls:
         await message.add_reaction("⏳")
         for i, url in enumerate(urls):
+            if url in SEEN_URLS:
+                logger.info(f"URL bereits verarbeitet, überspringe: {url}")
+                await message.add_reaction("🔁")
+                continue
             logger.info(f"Verarbeite URL: {url}")
             md_content = fetch_url_as_markdown(url)
             if md_content:
                 filename = f"webpage_{timestamp}_{i}.md"
                 filepath = os.path.join(RAW_DIR, filename)
                 try:
-                    with open(filepath, "w", encoding="utf-8") as f:
+                    with open(filepath + ".tmp", "w", encoding="utf-8") as f:
                         f.write(f"---\nQuelle: {url}\nDatum: {datetime.now().isoformat()}\n---\n\n")
                         f.write(md_content)
+                    os.rename(filepath + ".tmp", filepath)
+                    SEEN_URLS.add(url)
+                    _save_seen_urls(SEEN_URLS)
                     content_saved = True
                     logger.info(f"Webseite gespeichert: {filename}")
                 except Exception as e:
@@ -177,13 +211,14 @@ async def on_message(message):
     text_only = message.content
     for url in urls:
         text_only = text_only.replace(url, "").strip()
-    
+
     if text_only:
         filename = f"memo_{timestamp}.md"
         filepath = os.path.join(RAW_DIR, filename)
         try:
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open(filepath + ".tmp", "w", encoding="utf-8") as f:
                 f.write(text_only)
+            os.rename(filepath + ".tmp", filepath)
             content_saved = True
             logger.info(f"Text-Memo gespeichert: {filename}")
         except Exception as e:
@@ -195,23 +230,25 @@ async def on_message(message):
         for i, attachment in enumerate(message.attachments):
             safe_filename = "".join(c for c in attachment.filename if c.isalnum() or c in "._-")
             filepath = os.path.join(RAW_DIR, f"att_{timestamp}_{i}_{safe_filename}")
-            
+
             try:
-                await attachment.save(filepath)
+                await attachment.save(filepath + ".tmp")
+                os.rename(filepath + ".tmp", filepath)
                 content_saved = True
                 logger.info(f"Anhang gespeichert: {safe_filename}")
-                
+
                 # Audio direkt transkribieren
                 ext = safe_filename.split('.')[-1].lower()
                 if ext in ['ogg', 'mp3', 'wav', 'm4a']:
                     await message.add_reaction("🎙️")
                     transcription = transcribe_audio(filepath)
-                    
+
                     if transcription:
                         trans_filename = f"transkript_{timestamp}_{i}.md"
                         trans_filepath = os.path.join(RAW_DIR, trans_filename)
-                        with open(trans_filepath, "w", encoding="utf-8") as f:
+                        with open(trans_filepath + ".tmp", "w", encoding="utf-8") as f:
                             f.write(f"--- Audio Transkription ---\n{transcription}")
+                        os.rename(trans_filepath + ".tmp", trans_filepath)
                         logger.info(f"Audio erfolgreich transkribiert in {trans_filename}")
                         
                         # Wir löschen die originale Audio-Datei, um Platz auf dem Pi zu sparen
