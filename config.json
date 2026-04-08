@@ -8,8 +8,8 @@
     "system_rules": "./system_rules.md"
   },
   "models": {
-    "classification": "minimax/minimax-m2.7",
-    "text_update": "minimax/minimax-m2.7",
+    "classification": "google/gemma-4-26b-a4b-it",
+    "text_update": "google/gemini-3.1-flash-lite-preview",
     "vision_update": "google/gemma-4-26b-a4b-it",
     "audio_transcription": "google/gemini-2.5-flash-lite"
   },

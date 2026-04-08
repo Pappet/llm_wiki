@@ -60,12 +60,32 @@ else:
     logger.warning(f"Keine globale Regeldatei gefunden unter '{rules_file}'. Mache ohne weiter.")
 
 def get_existing_wiki_pages():
-    """Gibt eine Liste aller existierenden Themen (Dateinamen ohne .md) zurück, ignoriert den Index."""
+    """Gibt eine Liste von Dicts {name, title} aller existierenden Wiki-Seiten zurück."""
     wiki_dir = DIRS["wiki"]
     if not os.path.exists(wiki_dir):
         return []
-    # index.md explizit ausschließen, damit die KI da nichts reinschreibt
-    return [f[:-3] for f in os.listdir(wiki_dir) if f.endswith(".md") and f != "index.md"]
+    pages = []
+    for f in os.listdir(wiki_dir):
+        if not f.endswith(".md") or f == "index.md":
+            continue
+        name = f[:-3]
+        title = name
+        subheadings = []
+        try:
+            with open(os.path.join(wiki_dir, f), "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not title or title == name:
+                        if line.startswith("# "):
+                            title = line[2:].strip()
+                    elif line.startswith("## "):
+                        subheadings.append(line[3:].strip())
+                        if len(subheadings) >= 4:
+                            break
+        except Exception:
+            pass
+        pages.append({"name": name, "title": title, "subheadings": subheadings})
+    return pages
 
 def generate_index_file():
     """Erstellt eine index.md mit Links zu allen existierenden Wiki-Seiten."""
@@ -75,14 +95,12 @@ def generate_index_file():
     if not pages:
         return
         
-    pages.sort() # Alphabetisch sortieren für die Übersicht
+    pages.sort(key=lambda p: p["name"])
     index_path = os.path.join(wiki_dir, "index.md")
-    
+
     content = "# 📚 Wiki Index\n\nAutomatisch generierte Übersicht aller verfügbaren Themen-Seiten:\n\n"
     for page in pages:
-        # Formatiert den Link sauber, z.B. "Python Snippets" -> [python_snippets](python_snippets.md)
-        display_name = page.replace("_", " ").title()
-        content += f"- [{display_name}]({page}.md)\n"
+        content += f"- [{page['title']}]({page['name']}.md)\n"
         
     try:
         with open(index_path, "w", encoding="utf-8") as f:
@@ -176,28 +194,70 @@ def encode_image(image_path):
         logger.error(f"Fehler beim Kodieren des Bildes {image_path}: {e}")
         raise
 
+def _build_classification_excerpt(text):
+    """Extrahiert URL, Titel und Inhaltsanfang für die Klassifizierung."""
+    source_url = None
+    doc_title = None
+    body = text
+
+    # Frontmatter parsen (---\nQuelle: ...\n---)
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end > 0:
+            for line in text[3:end].splitlines():
+                if line.lower().startswith("quelle:"):
+                    source_url = line[7:].strip()
+            body = text[end + 3:].strip()
+
+    # Ersten H1-Titel aus dem Body extrahieren
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            doc_title = stripped[2:].strip()
+            break
+
+    parts = []
+    if source_url:
+        parts.append(f"Quelle-URL: {source_url}")
+    if doc_title:
+        parts.append(f"Dokumenttitel: {doc_title}")
+    parts.append(f"Inhalt:\n{body[:2000]}")
+
+    return "\n".join(parts)
+
+
 def classify_content(text=None, image_path=None, existing_pages=None):
     """
     Fragt die KI nach dem passenden Themengebiet, orientiert sich primär am bestehenden Index.
+    existing_pages: Liste von Dicts {name, title}
     """
-    existing_str = ", ".join(existing_pages) if existing_pages else "Noch keine Seiten vorhanden"
-    
-    system_prompt = f"""Du bist ein Router für ein Datei-basiertes Wiki-System. 
+    if existing_pages:
+        lines = []
+        for p in existing_pages:
+            entry = f'- {p["name"]}: "{p["title"]}"'
+            if p.get("subheadings"):
+                entry += f' [{", ".join(p["subheadings"])}]'
+            lines.append(entry)
+        existing_str = "\n".join(lines)
+    else:
+        existing_str = "Noch keine Seiten vorhanden"
+
+    system_prompt = f"""Du bist ein Router für ein Datei-basiertes Wiki-System.
 Deine Aufgabe ist es, Notizen einem passenden Thema zuzuordnen.
 
-Hier ist der Index der BEREITS EXISTIERENDEN Themen-Seiten in unserem Wiki:
-[{existing_str}]
+Hier ist der Index der BEREITS EXISTIERENDEN Themen-Seiten in unserem Wiki (Format: Dateiname: "Seitentitel"):
+{existing_str}
 
 REGELN:
-1. Wenn die Notiz inhaltlich gut zu einem der existierenden Themen passt, antworte EXAKT mit diesem Dateinamen.
-2. NUR wenn keines der bestehenden Themen passt, erfinde ein neues Thema (maximal 1-2 Wörter, durch Unterstrich getrennt).
-3. Antworte AUSSCHLIESSLICH mit dem Namen des Themas (ohne Dateiendung). Keine Sätze, keine Sonderzeichen, keine Erklärungen."""
+1. Wenn die Notiz inhaltlich gut zu einem der existierenden Themen passt, antworte EXAKT mit dem Dateinamen (linke Spalte).
+2. Falls keines der bestehenden Themen direkt passt, erfinde ein neues Thema (maximal 1-2 Wörter, durch Unterstrich getrennt).
+3. Antworte AUSSCHLIESSLICH mit dem Dateinamen des Themas (ohne Dateiendung). Keine Sätze, keine Sonderzeichen, keine Erklärungen."""
     
     model = config["models"]["classification"]
     messages = []
 
     if text and not image_path:
-        messages.append({"role": "user", "content": f"Klassifiziere diese Notiz:\n{text[:1000]}"})
+        messages.append({"role": "user", "content": f"Klassifiziere diese Notiz:\n{_build_classification_excerpt(text)}"})
     elif image_path:
         model = config["models"]["vision_update"]
         try:
@@ -230,7 +290,8 @@ REGELN:
 
     # Fuzzy-Abgleich gegen bestehende Seiten (deterministisch, kein API-Call)
     if existing_pages:
-        matches = difflib.get_close_matches(topic, existing_pages, n=1, cutoff=0.75)
+        page_names = [p["name"] for p in existing_pages]
+        matches = difflib.get_close_matches(topic, page_names, n=1, cutoff=0.75)
         if matches and matches[0] != topic:
             logger.info(f"Fuzzy-Match: '{topic}' → '{matches[0]}' (bestehende Seite)")
             topic = matches[0]
@@ -277,8 +338,8 @@ def process_batch():
             logger.warning(f"Ignoriere Datei '{file}': Nicht unterstütztes Format.")
             continue
 
-        if topic not in existing_pages:
-            existing_pages.append(topic)
+        if not any(p["name"] == topic for p in existing_pages):
+            existing_pages.append({"name": topic, "title": topic, "subheadings": []})
             logger.debug(f"Neues Thema '{topic}' zum laufenden Index hinzugefügt.")
 
     # 2. Wiki-Seiten generieren/updaten
@@ -296,11 +357,12 @@ def process_batch():
                 logger.error(f"Konnte bestehende Wiki-Datei {wiki_file} nicht lesen: {e}")
 
         # System Prompt aufbauen
-        existing_str = ", ".join([p for p in existing_pages if p != topic])
-        
+        other_pages = [p for p in existing_pages if p["name"] != topic]
+        existing_str = ", ".join(p["name"] for p in other_pages)
+
         system_prompt = f"Du pflegst ein technisches Markdown-Wiki. Dein aktuelles Thema ist: '{topic}'.\n"
         system_prompt += "Integriere die neuen Informationen sinnvoll in den bestehenden Inhalt. Lösche keine bestehenden Fakten. Antworte NUR mit dem reinen Markdown-Inhalt.\n\n"
-        
+
         if existing_str:
             system_prompt += f"QUERVERWEISE VERWENDEN: In unserem Wiki existieren bereits Seiten zu folgenden Themen: [{existing_str}]. Wenn im Text Konzepte auftauchen, die thematisch zu einer dieser Seiten passen, formatiere sie als Markdown-Link (Beispiel: [Linktext](Dateiname.md)).\n\n"
 
