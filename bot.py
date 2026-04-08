@@ -48,6 +48,15 @@ except Exception as e:
 DIRS = config["directories"]
 RAW_DIR = DIRS["raw"]
 os.makedirs(RAW_DIR, exist_ok=True)
+MAX_URLS = config.get("max_urls_per_message", 5)
+
+AUDIO_MIME_MAP = {
+    "ogg": "audio/ogg",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "m4a": "audio/mp4",
+    "mpeg": "audio/mpeg",
+}
 
 _raw_ids = os.getenv("ALLOWED_CHANNEL_IDS", "")
 ALLOWED_CHANNEL_IDS = set(int(cid.strip()) for cid in _raw_ids.split(",") if cid.strip())
@@ -79,8 +88,9 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 def extract_urls(text):
-    """Findet alle URLs in einem Text."""
-    return re.findall(r'(https?://[^\s]+)', text)
+    """Findet alle URLs in einem Text, bereinigt trailing Satzzeichen."""
+    urls = re.findall(r'https?://\S+', text)
+    return [u.rstrip('.,;:!?)]\'"') for u in urls]
 
 def fetch_url_as_markdown(url):
     """Nutzt die Jina API, um eine Webseite als Markdown zu extrahieren."""
@@ -111,9 +121,8 @@ def transcribe_audio(filepath):
         logger.error(f"Konnte Audio-Datei {filepath} nicht lesen: {e}")
         return None
 
-    # MIME-Type bestimmen (Discord Voice ist i.d.R. ogg)
     ext = filepath.split('.')[-1].lower()
-    mime_type = f"audio/{ext}" if ext in ['ogg', 'mp3', 'wav', 'mpeg'] else "audio/ogg"
+    mime_type = AUDIO_MIME_MAP.get(ext, "audio/ogg")
 
     base_url = config["openrouter_url"].rstrip("/")
     url = f"{base_url}/chat/completions"
@@ -182,7 +191,7 @@ async def on_message(message):
     content_saved = False
 
     # 1. URLs verarbeiten
-    urls = extract_urls(message.content)
+    urls = extract_urls(message.content)[:MAX_URLS]
     if urls:
         await message.add_reaction("⏳")
         for i, url in enumerate(urls):
