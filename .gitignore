@@ -12,3 +12,6 @@
 *.jpeg
 .obsidian/
 seen_urls.json
+config.json
+old_*.py
+__pycache__/
