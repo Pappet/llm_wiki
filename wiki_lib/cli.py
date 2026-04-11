@@ -154,7 +154,7 @@ Antworte AUSSCHLIESSLICH mit validem JSON ohne Fences:
 }"""
 
     raw = call_openrouter(
-        model=config["models"]["classification"],
+        model=config["models"]["text_update"],
         messages=[{"role": "user", "content": f"Wiki-Seite ({kind}/{slug}.md):\n\n{content[:6000]}"}],
         system_prompt=system_prompt,
         max_tokens=1200,
