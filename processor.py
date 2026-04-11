@@ -1703,7 +1703,7 @@ class Issue:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Pre-parse checks (fence parity + trailing whitespace)
+# Phase Pre: Fence-Parität + Trailing Whitespace (läuft immer, kein Parser)
 # ---------------------------------------------------------------------------
 
 def _check_fence_parity(content: str):
@@ -1712,7 +1712,7 @@ def _check_fence_parity(content: str):
     return (count % 2 != 0), count
 
 
-def _lint_phase1(rel_path: str, content: str) -> list:
+def _lint_phase_pre(rel_path: str, content: str) -> list:
     issues = []
 
     is_odd, count = _check_fence_parity(content)
@@ -1740,24 +1740,13 @@ def _lint_phase1(rel_path: str, content: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Structural checks (runs only if Phase 1 has no errors)
+# Phase 1.5: H1-Checks via Regex (parser-unabhängig, läuft auch bei unclosed_fence)
 # ---------------------------------------------------------------------------
 
-def _body_without_frontmatter(content: str) -> str:
-    """Gibt den Body-Teil zurück (nach Frontmatter, falls vorhanden)."""
-    if content.startswith("---"):
-        end = content.find("\n---", 3)
-        if end > 0:
-            body = content[end + 4:]
-            return body[1:] if body.startswith("\n") else body
-    return content
-
-
-def _lint_phase2(rel_path: str, content: str, kind: str) -> list:
+def _lint_phase1_5(rel_path: str, content: str) -> list:
     issues = []
     body = _body_without_frontmatter(content)
 
-    # H1 checks
     h1_matches = re.findall(r'^# [^#\n].+', body, re.MULTILINE)
     if not h1_matches:
         issues.append(Issue(
@@ -1775,6 +1764,23 @@ def _lint_phase2(rel_path: str, content: str, kind: str) -> list:
             detail=f"{len(h1_matches)} H1-Überschriften — nur eine erlaubt",
             fix_available=True,
         ))
+
+    return issues
+
+def _body_without_frontmatter(content: str) -> str:
+    """Gibt den Body-Teil zurück (nach Frontmatter, falls vorhanden)."""
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end > 0:
+            body = content[end + 4:]
+            return body[1:] if body.startswith("\n") else body
+    return content
+
+
+def _lint_phase2(rel_path: str, content: str, kind: str) -> list:
+    """Parser-abhängige Checks — wird bei unclosed_fence übersprungen."""
+    issues = []
+    body = _body_without_frontmatter(content)
 
     # Excessive blank lines (3+ consecutive blank lines = \n\n\n\n in file)
     if re.search(r'\n{4,}', body):
@@ -1852,8 +1858,10 @@ def _lint_phase2(rel_path: str, content: str, kind: str) -> list:
 
 def lint_page(abs_path: str, kind: str) -> list:
     """
-    Lintet eine einzelne Seite. Two-phase: Phase 1 (fence+whitespace),
-    dann Phase 2 nur wenn Phase 1 keine errors liefert.
+    Lintet eine einzelne Seite. Drei Phasen:
+    - Phase Pre:  fence + whitespace (immer)
+    - Phase 1.5:  H1-Checks via Regex (immer, parser-unabhängig)
+    - Phase 2:    section-Parser-Checks (nur wenn kein unclosed_fence)
     """
     try:
         with open(abs_path, "r", encoding="utf-8") as fh:
@@ -1868,12 +1876,13 @@ def lint_page(abs_path: str, kind: str) -> list:
         )]
 
     rel_path = os.path.relpath(abs_path, WIKI_ROOT)
-    p1 = _lint_phase1(rel_path, content)
+    p_pre = _lint_phase_pre(rel_path, content)
+    p1_5  = _lint_phase1_5(rel_path, content)
 
-    if any(i.severity == "error" for i in p1):
-        return p1  # Parser würde auf kaputter Datei lügen → nur Phase-1-Issues
+    if any(i.kind == "unclosed_fence" for i in p_pre):
+        return p_pre + p1_5  # Parser würde auf kaputter Datei lügen
 
-    return p1 + _lint_phase2(rel_path, content, kind)
+    return p_pre + p1_5 + _lint_phase2(rel_path, content, kind)
 
 
 def lint_all() -> list:
@@ -1934,12 +1943,12 @@ def _fix_missing_h1(content: str, abs_path: str) -> str:
             after_fm = content[end + 4:]
             if re.search(r'^# [^#\n]', after_fm, re.MULTILINE):
                 return content  # bereits vorhanden
-            body = after_fm.lstrip("\n")
-            return content[:end + 4] + "\n" + h1_line + body
+            body = re.sub(r'^\n+', '', after_fm)
+            return content[:end + 5] + h1_line + body
 
     if re.search(r'^# [^#\n]', content, re.MULTILINE):
         return content
-    return h1_line + content.lstrip("\n")
+    return h1_line + re.sub(r'^\n+', '', content)
 
 
 def _fix_multi_h1(content: str) -> str:
@@ -1960,12 +1969,15 @@ def _fix_multi_h1(content: str) -> str:
 
 
 def _split_fm_body(content: str):
-    """Returns (fm_prefix, body). fm_prefix endet mit \\n."""
+    """Returns (fm_prefix, body). fm_prefix = alles bis inkl. schließendes ---.
+    body beginnt mit dem \n nach --- und ist exakt content[end+4:], sodass
+    fm_prefix + body == content (Identität, kein Informationsverlust).
+    """
     if content.startswith("---"):
         end = content.find("\n---", 3)
         if end > 0:
-            fm_prefix = content[:end + 4] + "\n"
-            body = content[end + 5:]
+            fm_prefix = content[:end + 4]
+            body = content[end + 4:]
             return fm_prefix, body
     return "", content
 
