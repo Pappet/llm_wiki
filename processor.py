@@ -8,6 +8,7 @@ import re
 import difflib
 import argparse
 import requests
+from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict
@@ -775,11 +776,12 @@ ANTWORTE AUSSCHLIESSLICH MIT VALIDEM JSON, ohne Markdown-Fences, ohne Erklärung
     raw = call_openrouter(model=model, messages=messages, system_prompt=system_prompt, max_tokens=1200)
     result = _parse_classification(raw, existing_pages)
 
+    _ent_summary = [f"{e['slug']}({e['type']})" for e in result['entities']]
     logger.info(
         f"Klassifikation: primary='{result['primary']['page']}'"
         + (" (NEU)" if result['primary']['is_new'] else "")
         + (f", secondary={[s['page'] for s in result['secondary']]}" if result['secondary'] else "")
-        + (f", entities={[f'{e['slug']}({e['type']})' for e in result['entities']]}" if result['entities'] else "")
+        + (f", entities={_ent_summary}" if _ent_summary else "")
     )
     return result
 
@@ -1606,8 +1608,6 @@ def process_batch():
         # Entities einsammeln
         for ent in classification["entities"]:
             primary_entity_refs[primary_page].append(ent)
-            # Kontext für Backlink: 1-Satz-Auszug aus der Notiz ist schwer, wir nehmen
-            # stattdessen die Rolle + erste 120 Zeichen der Notiz als Kontext.
             if entry["content"]:
                 snippet = re.sub(r'\s+', ' ', entry["content"]).strip()[:120]
             else:
@@ -1667,13 +1667,11 @@ def process_batch():
             "context": assignment["context"],
         }
         if ent["is_new"]:
-            # Neu anlegen (falls nicht bereits durch eine frühere Iteration im selben Batch passiert)
             if not os.path.exists(_page_file_path(ent["slug"], "entity")):
                 if _ensure_entity_page(ent, backlink):
                     entity_create_count += 1
                     log_entries.append(_log_entry("entity_create", f"entities/{ent['slug']}.md | {ent['type']}"))
             else:
-                # Wurde schon in diesem Batch angelegt → Append
                 _append_entity_backlink(ent["slug"], backlink)
                 entity_append_count += 1
         else:
@@ -1689,17 +1687,645 @@ def process_batch():
 
 
 # ============================================================================
+# STRUCTURAL LINTER
+# ============================================================================
+
+@dataclass
+class Issue:
+    path: str          # relativer Pfad ab wiki/
+    kind: str          # "multi_h1" | "missing_h1" | "unclosed_fence" |
+                       # "excessive_blank_lines" | "trailing_whitespace" |
+                       # "duplicate_section" | "empty_mentions" |
+                       # "frontmatter_drift"
+    severity: str      # "error" | "warning"
+    detail: str        # human-readable
+    fix_available: bool
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Pre-parse checks (fence parity + trailing whitespace)
+# ---------------------------------------------------------------------------
+
+def _check_fence_parity(content: str):
+    """Returns (is_odd, count). True wenn ungerade Anzahl ``` Marker."""
+    count = len(re.findall(r'^```', content, re.MULTILINE))
+    return (count % 2 != 0), count
+
+
+def _lint_phase1(rel_path: str, content: str) -> list:
+    issues = []
+
+    is_odd, count = _check_fence_parity(content)
+    if is_odd:
+        issues.append(Issue(
+            path=rel_path,
+            kind="unclosed_fence",
+            severity="error",
+            detail=f"{count} Fence-Marker (ungerade — ein Block ist nicht geschlossen)",
+            fix_available=True,
+        ))
+
+    trailing_lines = [i + 1 for i, ln in enumerate(content.splitlines()) if ln != ln.rstrip()]
+    if trailing_lines:
+        sample = trailing_lines[:5]
+        issues.append(Issue(
+            path=rel_path,
+            kind="trailing_whitespace",
+            severity="warning",
+            detail=f"Trailing Whitespace in {len(trailing_lines)} Zeile(n), z.B. {sample}",
+            fix_available=True,
+        ))
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Structural checks (runs only if Phase 1 has no errors)
+# ---------------------------------------------------------------------------
+
+def _body_without_frontmatter(content: str) -> str:
+    """Gibt den Body-Teil zurück (nach Frontmatter, falls vorhanden)."""
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end > 0:
+            body = content[end + 4:]
+            return body[1:] if body.startswith("\n") else body
+    return content
+
+
+def _lint_phase2(rel_path: str, content: str, kind: str) -> list:
+    issues = []
+    body = _body_without_frontmatter(content)
+
+    # H1 checks
+    h1_matches = re.findall(r'^# [^#\n].+', body, re.MULTILINE)
+    if not h1_matches:
+        issues.append(Issue(
+            path=rel_path,
+            kind="missing_h1",
+            severity="error",
+            detail="Kein H1-Titel vorhanden",
+            fix_available=True,
+        ))
+    elif len(h1_matches) > 1:
+        issues.append(Issue(
+            path=rel_path,
+            kind="multi_h1",
+            severity="error",
+            detail=f"{len(h1_matches)} H1-Überschriften — nur eine erlaubt",
+            fix_available=True,
+        ))
+
+    # Excessive blank lines (3+ consecutive blank lines = \n\n\n\n in file)
+    if re.search(r'\n{4,}', body):
+        count = len(re.findall(r'\n{4,}', body))
+        issues.append(Issue(
+            path=rel_path,
+            kind="excessive_blank_lines",
+            severity="warning",
+            detail=f"{count} Stelle(n) mit 3+ aufeinanderfolgenden Leerzeilen",
+            fix_available=True,
+        ))
+
+    # Duplicate H2 sections
+    parsed = parse_sections(body)
+    slugs = [s['slug'] for s in parsed['sections']]
+    seen: set = set()
+    dupes: set = set()
+    for slug in slugs:
+        if slug in seen:
+            dupes.add(slug)
+        seen.add(slug)
+    if dupes:
+        issues.append(Issue(
+            path=rel_path,
+            kind="duplicate_section",
+            severity="error",
+            detail=f"Doppelte H2-Sektionen: {sorted(dupes)}",
+            fix_available=True,
+        ))
+
+    # Empty mentions sections
+    empty_headings = []
+    for s in parsed['sections']:
+        heading_norm = s['heading'].lstrip('#').strip().lower()
+        if heading_norm in ("erwähnt in", "erwähnungen"):
+            if not s['body'].strip():
+                empty_headings.append(s['heading'].strip())
+    if empty_headings:
+        issues.append(Issue(
+            path=rel_path,
+            kind="empty_mentions",
+            severity="warning",
+            detail=f"Leere Mentions-Sektion(en): {empty_headings}",
+            fix_available=True,
+        ))
+
+    # Frontmatter drift (entities only)
+    if kind == "entity" and content.startswith("---"):
+        fm, _ = parse_frontmatter(content)
+        fm_count = fm.get("mention_count", 0)
+        actual_count = 0
+        mentions_slug_target = _slugify_heading(MENTIONS_HEADING)
+        for s in parsed['sections']:
+            if s['slug'] == mentions_slug_target:
+                actual_count = sum(
+                    1 for ln in s['body'].splitlines()
+                    if re.match(r'^\s*-\s*\[\d{4}-\d{2}-\d{2}\]', ln)
+                )
+                break
+        if fm_count != actual_count:
+            issues.append(Issue(
+                path=rel_path,
+                kind="frontmatter_drift",
+                severity="warning",
+                detail=f"mention_count={fm_count} im Frontmatter, {actual_count} Backlink-Zeile(n) gezählt",
+                fix_available=True,
+            ))
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Public lint entry points
+# ---------------------------------------------------------------------------
+
+def lint_page(abs_path: str, kind: str) -> list:
+    """
+    Lintet eine einzelne Seite. Two-phase: Phase 1 (fence+whitespace),
+    dann Phase 2 nur wenn Phase 1 keine errors liefert.
+    """
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except Exception as e:
+        return [Issue(
+            path=abs_path,
+            kind="unclosed_fence",
+            severity="error",
+            detail=f"Datei nicht lesbar: {e}",
+            fix_available=False,
+        )]
+
+    rel_path = os.path.relpath(abs_path, WIKI_ROOT)
+    p1 = _lint_phase1(rel_path, content)
+
+    if any(i.severity == "error" for i in p1):
+        return p1  # Parser würde auf kaputter Datei lügen → nur Phase-1-Issues
+
+    return p1 + _lint_phase2(rel_path, content, kind)
+
+
+def lint_all() -> list:
+    """Lintet alle Seiten in topics/ und entities/. Returns list[Issue]."""
+    issues = []
+
+    if os.path.isdir(TOPICS_DIR):
+        for f in sorted(os.listdir(TOPICS_DIR)):
+            if not f.endswith(".md") or f in RESERVED_WIKI_FILES:
+                continue
+            issues.extend(lint_page(os.path.join(TOPICS_DIR, f), "topic"))
+
+    if os.path.isdir(ENTITIES_DIR):
+        for f in sorted(os.listdir(ENTITIES_DIR)):
+            if not f.endswith(".md"):
+                continue
+            issues.extend(lint_page(os.path.join(ENTITIES_DIR, f), "entity"))
+
+    return issues
+
+
+# ============================================================================
+# FIX FUNCTIONS (alle idempotent, string-in / string-out)
+# ============================================================================
+
+def _fix_trailing_whitespace(content: str) -> str:
+    lines = content.splitlines()
+    result = "\n".join(ln.rstrip() for ln in lines)
+    if content.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _fix_unclosed_fence(content: str) -> str:
+    """Fügt einen schließenden ``` ans Ende an wenn Anzahl ungerade."""
+    is_odd, _ = _check_fence_parity(content)
+    if not is_odd:
+        return content
+    if not content.endswith("\n"):
+        content += "\n"
+    return content + "```\n"
+
+
+def _fix_excessive_blanks(content: str) -> str:
+    """Reduziert 3+ aufeinanderfolgende Leerzeilen auf 2."""
+    return re.sub(r'\n{4,}', '\n\n\n', content)
+
+
+def _fix_missing_h1(content: str, abs_path: str) -> str:
+    """Fügt H1 aus Dateiname ein, direkt nach Frontmatter (oder am Dateianfang)."""
+    slug = os.path.splitext(os.path.basename(abs_path))[0]
+    title = slug.replace("_", " ").title()
+    h1_line = f"# {title}\n\n"
+
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end > 0:
+            after_fm = content[end + 4:]
+            if re.search(r'^# [^#\n]', after_fm, re.MULTILINE):
+                return content  # bereits vorhanden
+            body = after_fm.lstrip("\n")
+            return content[:end + 4] + "\n" + h1_line + body
+
+    if re.search(r'^# [^#\n]', content, re.MULTILINE):
+        return content
+    return h1_line + content.lstrip("\n")
+
+
+def _fix_multi_h1(content: str) -> str:
+    """Konvertiert alle H1 außer dem ersten zu H2."""
+    lines = content.splitlines(keepends=True)
+    first_seen = False
+    result = []
+    for line in lines:
+        if re.match(r'^# [^#]', line):
+            if not first_seen:
+                first_seen = True
+                result.append(line)
+            else:
+                result.append("## " + line[2:])
+        else:
+            result.append(line)
+    return "".join(result)
+
+
+def _split_fm_body(content: str):
+    """Returns (fm_prefix, body). fm_prefix endet mit \\n."""
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end > 0:
+            fm_prefix = content[:end + 4] + "\n"
+            body = content[end + 5:]
+            return fm_prefix, body
+    return "", content
+
+
+def _fix_duplicate_sections(content: str) -> str:
+    """
+    Merged doppelte H2-Sektionen: Bodies konkateniert in Reihenfolge,
+    erster Header gewinnt.
+    """
+    fm_prefix, body = _split_fm_body(content)
+    parsed = parse_sections(body)
+
+    first_occurrence: dict = {}
+    to_remove = []
+
+    for i, s in enumerate(parsed['sections']):
+        slug = s['slug']
+        if slug not in first_occurrence:
+            first_occurrence[slug] = i
+        else:
+            fi = first_occurrence[slug]
+            merged_body = (
+                parsed['sections'][fi]['body'].rstrip('\n') + '\n\n'
+                + parsed['sections'][i]['body']
+            )
+            h = parsed['sections'][fi]['heading']
+            parsed['sections'][fi] = {
+                'heading': h, 'slug': slug,
+                'body': merged_body,
+                'original': h + '\n' + merged_body,
+            }
+            to_remove.append(i)
+
+    parsed['sections'] = [s for i, s in enumerate(parsed['sections']) if i not in to_remove]
+    return fm_prefix + reassemble_page(parsed['preamble'], parsed['sections'])
+
+
+def _fix_empty_mentions(content: str) -> str:
+    """Entfernt leere ## Erwähnungen / ## Erwähnt in Sektionen."""
+    fm_prefix, body = _split_fm_body(content)
+    parsed = parse_sections(body)
+
+    filtered = [
+        s for s in parsed['sections']
+        if not (
+            s['heading'].lstrip('#').strip().lower() in ("erwähnt in", "erwähnungen")
+            and not s['body'].strip()
+        )
+    ]
+    parsed['sections'] = filtered
+    return fm_prefix + reassemble_page(parsed['preamble'], parsed['sections'])
+
+
+def _fix_frontmatter_drift(content: str) -> str:
+    """Korrigiert mention_count im Frontmatter anhand tatsächlicher Backlink-Zeilen."""
+    if not content.startswith("---"):
+        return content
+    if content.find("\n---", 3) < 0:
+        return content
+
+    fm, body = parse_frontmatter(content)
+    parsed = parse_sections(body)
+
+    actual_count = 0
+    target_slug = _slugify_heading(MENTIONS_HEADING)
+    for s in parsed['sections']:
+        if s['slug'] == target_slug:
+            actual_count = sum(
+                1 for ln in s['body'].splitlines()
+                if re.match(r'^\s*-\s*\[\d{4}-\d{2}-\d{2}\]', ln)
+            )
+            break
+
+    fm["mention_count"] = actual_count
+    return serialize_frontmatter(fm, body)
+
+
+# ---------------------------------------------------------------------------
+# fix_page orchestrator
+# ---------------------------------------------------------------------------
+
+# Reihenfolge ist fix — Änderung hat Konsequenzen
+_FIX_ORDER = [
+    "trailing_whitespace",
+    "unclosed_fence",
+    "excessive_blank_lines",
+    "missing_h1",
+    "multi_h1",
+    "duplicate_section",
+    "empty_mentions",
+    "frontmatter_drift",
+]
+
+
+def fix_page(abs_path: str, kind: str, issues: list):
+    """
+    Wendet alle verfügbaren Fixes für die gegebenen Issues an.
+    Returns: (new_content: str | None, applied_fixes: list[str])
+    Schreibt NICHT auf Disk — Caller macht Backup + Schreiben.
+    """
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except Exception as e:
+        return None, [f"LESEFEHLER: {e}"]
+
+    issue_kinds = {i.kind for i in issues if i.fix_available}
+    applied = []
+
+    for fix_kind in _FIX_ORDER:
+        if fix_kind not in issue_kinds:
+            continue
+        if fix_kind == "trailing_whitespace":
+            content = _fix_trailing_whitespace(content)
+        elif fix_kind == "unclosed_fence":
+            content = _fix_unclosed_fence(content)
+        elif fix_kind == "excessive_blank_lines":
+            content = _fix_excessive_blanks(content)
+        elif fix_kind == "missing_h1":
+            content = _fix_missing_h1(content, abs_path)
+        elif fix_kind == "multi_h1":
+            content = _fix_multi_h1(content)
+        elif fix_kind == "duplicate_section":
+            content = _fix_duplicate_sections(content)
+        elif fix_kind == "empty_mentions":
+            content = _fix_empty_mentions(content)
+        elif fix_kind == "frontmatter_drift":
+            content = _fix_frontmatter_drift(content)
+        applied.append(fix_kind)
+
+    return content, applied
+
+
+# ============================================================================
+# BACKUP HELPERS
+# ============================================================================
+
+def _make_backup_path(run_timestamp: str, rel_path: str) -> str:
+    backup_root = config["directories"].get("backups", "./wiki_backups")
+    return os.path.join(backup_root, run_timestamp, rel_path)
+
+
+def _backup_file(src_abs: str, run_timestamp: str) -> str:
+    """Erstellt Backup unter backups/<timestamp>/<rel_path>. Lazy mkdir."""
+    rel = os.path.relpath(src_abs, WIKI_ROOT)
+    dst = _make_backup_path(run_timestamp, rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src_abs, dst)
+    return dst
+
+
+def _atomic_write(path: str, content: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.rename(tmp, path)
+
+
+# ============================================================================
+# CLI HELPERS FOR LINTER
+# ============================================================================
+
+def _group_issues_by_path(issues: list) -> dict:
+    grouped: dict = defaultdict(list)
+    for issue in issues:
+        grouped[issue.path].append(issue)
+    return grouped
+
+
+def _abs_from_rel(rel_path: str) -> str:
+    return os.path.join(WIKI_ROOT, rel_path)
+
+
+def _kind_from_rel(rel_path: str) -> str:
+    parts = rel_path.replace("\\", "/").split("/")
+    return "entity" if parts[0] == "entities" else "topic"
+
+
+# ============================================================================
+# NEW CLI ENTRY POINTS
+# ============================================================================
+
+def cli_validate():
+    """--validate: Readonly-Lint. Exit 1 bei errors, Exit 0 wenn clean."""
+    issues = lint_all()
+    if not issues:
+        print("✓ Keine Strukturprobleme gefunden.")
+        sys.exit(0)
+
+    errors = [i for i in issues if i.severity == "error"]
+    warnings = [i for i in issues if i.severity == "warning"]
+
+    for i in sorted(issues, key=lambda x: (x.path, x.severity)):
+        marker = "✗" if i.severity == "error" else "⚠"
+        fix_hint = " [fixable]" if i.fix_available else ""
+        print(f"  {marker} [{i.severity.upper()}] {i.path}: {i.kind} — {i.detail}{fix_hint}")
+
+    print(f"\n  {len(errors)} Fehler, {len(warnings)} Warnung(en).")
+    sys.exit(1 if errors else 0)
+
+
+def cli_clean_structure(dry_run: bool):
+    """--clean-structure [--dry-run]: Fixes anwenden mit automatischem Backup."""
+    issues = lint_all()
+    fixable = [i for i in issues if i.fix_available]
+
+    if not fixable:
+        if not issues:
+            print("✓ Keine Strukturprobleme gefunden.")
+        else:
+            print(f"⚠ {len(issues)} Issue(s), kein automatischer Fix verfügbar.")
+            for i in issues:
+                print(f"  {i.path}: {i.kind} — {i.detail}")
+        return
+
+    grouped = _group_issues_by_path(fixable)
+    run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fixed_count = 0
+
+    for rel_path in sorted(grouped):
+        abs_path = _abs_from_rel(rel_path)
+        if not os.path.exists(abs_path):
+            logger.warning(f"Linter: {rel_path} nicht mehr auf Disk.")
+            continue
+
+        kind = _kind_from_rel(rel_path)
+        new_content, applied = fix_page(abs_path, kind, grouped[rel_path])
+
+        if new_content is None or not applied:
+            continue
+
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            old_content = fh.read()
+
+        if new_content == old_content:
+            continue  # idempotent — keine effektive Änderung
+
+        if dry_run:
+            print(f"  [DRY-RUN] {rel_path}: {applied}")
+        else:
+            _backup_file(abs_path, run_ts)
+            _atomic_write(abs_path, new_content)
+            print(f"  ✓ {rel_path}: {applied}")
+            fixed_count += 1
+
+    if not dry_run:
+        if fixed_count:
+            backup_root = config["directories"].get("backups", "./wiki_backups")
+            print(f"\n  {fixed_count} Datei(en) bereinigt → Backup: {backup_root}/{run_ts}/")
+        else:
+            print("  ✓ Keine effektiven Änderungen nötig.")
+
+
+def cli_clean_semantic(slug: str):
+    """
+    --clean-semantic <slug>: LLM-Diagnose für ein Topic oder Entity.
+    Verändert NICHTS — druckt JSON-Diagnose auf stdout.
+    """
+    slug = _sanitize_topic(slug)
+    if not slug:
+        logger.error("Ungültiger Slug.")
+        sys.exit(1)
+
+    topic_path = _page_file_path(slug, "topic")
+    entity_path = _page_file_path(slug, "entity")
+
+    if os.path.exists(topic_path):
+        abs_path, kind = topic_path, "topic"
+    elif os.path.exists(entity_path):
+        abs_path, kind = entity_path, "entity"
+    else:
+        logger.error(f"Seite '{slug}' nicht gefunden (weder topics/ noch entities/).")
+        sys.exit(1)
+
+    with open(abs_path, "r", encoding="utf-8") as fh:
+        content = fh.read()
+
+    system_prompt = """Du bist ein Wiki-Qualitätsanalyst. Analysiere die folgende Wiki-Seite.
+
+Antworte AUSSCHLIESSLICH mit validem JSON ohne Fences:
+{
+  "summary": "1-2 Sätze Gesamtbewertung",
+  "strengths": ["was gut ist"],
+  "issues": [
+    {"kind": "...", "description": "...", "severity": "error|warning|suggestion"}
+  ],
+  "suggestions": ["konkrete Verbesserungsvorschläge"]
+}"""
+
+    raw = call_openrouter(
+        model=config["models"]["classification"],
+        messages=[{"role": "user", "content": f"Wiki-Seite ({kind}/{slug}.md):\n\n{content[:6000]}"}],
+        system_prompt=system_prompt,
+        max_tokens=1200,
+    )
+
+    if not raw:
+        print(json.dumps({"error": "LLM lieferte keine Antwort"}, ensure_ascii=False, indent=2))
+        sys.exit(1)
+
+    data = _extract_json_object(raw)
+    print(json.dumps(data if data else {"raw": raw}, ensure_ascii=False, indent=2))
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM-Wiki Processor")
+    parser = argparse.ArgumentParser(
+        description="LLM-Wiki Processor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Beispiele:
+  python processor.py                             # Batch-Verarbeitung (Standard)
+  python processor.py --validate                  # Strukturprüfung (readonly, exit 1 bei Fehlern)
+  python processor.py --clean-structure           # Strukturprobleme automatisch fixen (mit Backup)
+  python processor.py --clean-structure --dry-run # Vorschau ohne Änderungen
+  python processor.py --clean-semantic rag        # LLM-Diagnose für topics/rag.md
+  python processor.py --refresh-entity llama_3    # Entity-Description neu schreiben
+        """
+    )
     parser.add_argument(
         "--refresh-entity",
         metavar="SLUG",
         help="Description einer bestehenden Entity neu schreiben lassen (mit Backup)"
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Strukturprüfung: readonly, exit 1 bei Fehlern"
+    )
+    parser.add_argument(
+        "--clean-structure",
+        action="store_true",
+        help="Strukturprobleme automatisch fixen (erstellt Backup)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Zusammen mit --clean-structure: zeigt Änderungen ohne sie anzuwenden"
+    )
+    parser.add_argument(
+        "--clean-semantic",
+        metavar="SLUG",
+        help="LLM-Qualitätsanalyse für eine Seite (readonly, gibt JSON aus)"
+    )
     args = parser.parse_args()
+
+    if args.validate:
+        cli_validate()
+        return
+
+    if args.clean_structure:
+        cli_clean_structure(dry_run=args.dry_run)
+        return
+
+    if args.clean_semantic:
+        cli_clean_semantic(args.clean_semantic)
+        return
 
     if args.refresh_entity:
         slug = _sanitize_topic(args.refresh_entity)
