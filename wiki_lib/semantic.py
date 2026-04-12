@@ -62,6 +62,9 @@ def analyze_page(slug: str, kind: str) -> tuple[dict | None, int]:
 
     # 1. Page laden, Hash berechnen
     current_hash = _content_hash(content)
+    
+    parsed = parse_sections(content)
+    valid_slugs = [s['slug'] for s in parsed['sections']]
 
     # 2. Bestehende Diagnosen laden und alte offene als stale setzen, falls Datei verändert
     refresh_stale_status(slug, kind, current_hash)
@@ -92,7 +95,12 @@ ISSUE-KINDS (nutze GENAU einen von diesen):
 Für jede Issue:
 - description: 1-2 Sätze, konkret und aktionable
 - severity: "error" | "warning" | "suggestion"
-- sections_involved: Liste der exakten Sektion-Slugs (Nutze ZWINGEND Unterstriche _ statt Bindestriche -! WICHTIG: Bei "duplicate_content" MÜSSEN exakt ZWEI Slugs stehen. Leer, wenn seitenweit.)
+- sections_involved: Liste der exakten Sektion-Slugs (Nutze ZWINGEND Unterstriche _ statt Bindestriche -! Leer, wenn seitenweit.)
+
+WICHTIGE REGELN FÜR 'sections_involved':
+1. Du DARFST AUSSCHLIESSLICH Slugs aus dieser Liste verwenden: {valid_slugs}
+2. Wenn ein Problem innerhalb einer H3-Unterüberschrift auftritt, gib den Slug der übergeordneten H2-Sektion an.
+3. Wenn eine Wiederholung innerhalb der gleichen H2-Sektion auftritt (z. B. zwischen Einleitung und einer H3), ist das KEIN 'duplicate_content', sondern 'redundant_paragraphs'. 'sections_involved' enthält dann nur diesen einen Slug. Bei echtem 'duplicate_content' müssen es ZWEI Einträge sein.
 
 BESTEHENDE WIKI-SEITEN (für contradicts_other_page und missing_context):
 {context_str}
