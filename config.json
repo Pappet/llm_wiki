@@ -2,7 +2,9 @@
   "directories": {
     "raw": "./wiki_input/raw",
     "processed": "./wiki_input/processed",
-    "wiki": "./wiki_data"
+    "wiki": "./wiki_data",
+    "backups": "./wiki_backups",
+    "diagnostics": "./wiki_diagnostics"
   },
   "files": {
     "system_rules": "./system_rules.md"

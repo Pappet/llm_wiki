@@ -21,3 +21,10 @@ RESERVED_WIKI_FILES = {"index.md", "log.md"}
 # Heading-Konstanten — werden in entities.py, secondary.py und linter.py verwendet
 MENTIONS_HEADING = "## Erwähnt in"
 SECONDARY_MENTIONS_HEADING = "## Erwähnungen"
+
+AUTO_APPLICABLE_KINDS = {
+    "duplicate_content",
+    "redundant_paragraphs",
+    "malformed_list",
+    "section_misplaced",
+}

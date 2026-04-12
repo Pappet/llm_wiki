@@ -17,3 +17,4 @@ old_*.py
 __pycache__/
 .pytest_cache
 wiki_backups/
+wiki_diagnostics/

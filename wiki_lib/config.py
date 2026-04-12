@@ -2,7 +2,7 @@
 config.py — Konfiguration, Logging und Verzeichnis-Konstanten.
 Layer 0: keine wiki_lib-Imports.
 
-Exports: config, DIRS, WIKI_ROOT, TOPICS_DIR, ENTITIES_DIR, GLOBAL_RULES, API_KEY, logger
+Exports: config, DIRS, WIKI_ROOT, TOPICS_DIR, ENTITIES_DIR, DIAGNOSTICS_DIR, GLOBAL_RULES, API_KEY, logger
 """
 
 import os
@@ -43,6 +43,7 @@ DIRS = config["directories"]
 WIKI_ROOT = DIRS["wiki"]
 TOPICS_DIR = os.path.join(WIKI_ROOT, "topics")
 ENTITIES_DIR = os.path.join(WIKI_ROOT, "entities")
+DIAGNOSTICS_DIR = DIRS.get("diagnostics", "./wiki_diagnostics")
 
 for _path in (DIRS["raw"], DIRS["processed"], WIKI_ROOT, TOPICS_DIR, ENTITIES_DIR):
     os.makedirs(_path, exist_ok=True)
