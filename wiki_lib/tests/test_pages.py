@@ -56,5 +56,61 @@ class TestReadPageMeta(unittest.TestCase):
         self.assertLessEqual(len(subheadings), 4)
 
 
+class TestReadEntityMeta(unittest.TestCase):
+
+    def test_reads_frontmatter_and_title(self):
+        content = (
+            "---\n"
+            "type: tool\n"
+            "name: PostgreSQL\n"
+            "aliases: []\n"
+            "first_seen: 2024-01-01\n"
+            "last_updated: 2024-01-01\n"
+            "mention_count: 3\n"
+            "---\n"
+            "# PostgreSQL\n\n"
+            "*Relationales Open-Source-Datenbanksystem.*\n\n"
+            "## Erwähnt in\n\n"
+        )
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
+            f.write(content)
+            path = f.name
+        from wiki_lib.pages import _read_entity_meta
+        fm, title, description = _read_entity_meta(path, "fallback")
+        os.unlink(path)
+        self.assertEqual(title, "PostgreSQL")
+        self.assertEqual(fm.get("type"), "tool")
+        self.assertEqual(fm.get("mention_count"), 3)
+        self.assertIn("Relationales", description)
+
+    def test_fallback_name_on_missing_file(self):
+        from wiki_lib.pages import _read_entity_meta
+        fm, title, description = _read_entity_meta("/does/not/exist.md", "my_fallback")
+        self.assertEqual(title, "my_fallback")
+        self.assertEqual(fm, {})
+        self.assertEqual(description, "")
+
+    def test_no_description_line_returns_empty_string(self):
+        content = (
+            "---\n"
+            "type: concept\n"
+            "name: Embeddings\n"
+            "aliases: []\n"
+            "first_seen: 2024-01-01\n"
+            "last_updated: 2024-01-01\n"
+            "mention_count: 1\n"
+            "---\n"
+            "# Embeddings\n\n"
+            "## Erwähnt in\n\n"
+        )
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
+            f.write(content)
+            path = f.name
+        from wiki_lib.pages import _read_entity_meta
+        fm, title, description = _read_entity_meta(path, "fallback")
+        os.unlink(path)
+        self.assertEqual(description, "")
+
+
 if __name__ == '__main__':
     unittest.main()

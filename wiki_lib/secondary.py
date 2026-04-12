@@ -15,6 +15,9 @@ from .pages import _page_file_path
 
 
 def update_secondary_page_deterministic(secondary_page, references, existing_pages):
+    if not references:
+        return
+
     wiki_file = _page_file_path(secondary_page, "topic")
     today = datetime.now().strftime("%Y-%m-%d")
     entry_lines = [
