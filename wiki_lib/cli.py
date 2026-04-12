@@ -20,6 +20,8 @@ from .entities import refresh_entity_description
 from .classifier import _sanitize_topic
 from .pages import _page_file_path
 from .openrouter import call_openrouter, _extract_json_object
+from .semantic import analyze_page, apply_issue
+from .diagnostics import list_all_diagnostics, load_diagnostics, set_issue_status
 
 
 # ============================================================================
@@ -120,7 +122,6 @@ def cli_clean_structure(dry_run: bool):
 def cli_clean_semantic(slug: str):
     """
     --clean-semantic <slug>: LLM-Qualitätsdiagnose für ein Topic oder Entity.
-    Verändert NICHTS — gibt JSON auf stdout aus.
     """
     slug = _sanitize_topic(slug)
     if not slug:
@@ -131,41 +132,90 @@ def cli_clean_semantic(slug: str):
     entity_path = _page_file_path(slug, "entity")
 
     if os.path.exists(topic_path):
-        abs_path, kind = topic_path, "topic"
+        kind = "topic"
     elif os.path.exists(entity_path):
-        abs_path, kind = entity_path, "entity"
+        kind = "entity"
     else:
         logger.error(f"Seite '{slug}' nicht gefunden (weder topics/ noch entities/).")
         sys.exit(1)
 
-    with open(abs_path, "r", encoding="utf-8") as fh:
-        content = fh.read()
+    print(f"Analysiere {kind}/{slug}.md...")
+    data, n_new = analyze_page(slug, kind)
 
-    system_prompt = """Du bist ein Wiki-Qualitätsanalyst. Analysiere die folgende Wiki-Seite.
-
-Antworte AUSSCHLIESSLICH mit validem JSON ohne Fences:
-{
-  "summary": "1-2 Sätze Gesamtbewertung",
-  "strengths": ["was gut ist"],
-  "issues": [
-    {"kind": "...", "description": "...", "severity": "error|warning|suggestion"}
-  ],
-  "suggestions": ["konkrete Verbesserungsvorschläge"]
-}"""
-
-    raw = call_openrouter(
-        model=config["models"]["classification"],
-        messages=[{"role": "user", "content": f"Wiki-Seite ({kind}/{slug}.md):\n\n{content[:32000]}"}],
-        system_prompt=system_prompt,
-        max_tokens=3000,
-    )
-
-    if not raw:
-        print(json.dumps({"error": "LLM lieferte keine Antwort"}, ensure_ascii=False, indent=2))
+    if not data:
+        logger.error("Analyse fehlgeschlagen.")
         sys.exit(1)
 
-    data = _extract_json_object(raw)
-    print(json.dumps(data if data else {"raw": raw}, ensure_ascii=False, indent=2))
+    stale = len([i for i in data.get("issues", []) if i.get("status") == "stale"])
+    open_iss = len([i for i in data.get("issues", []) if i.get("status") == "open"])
+    print(f"✓ Analyse beendet. {n_new} neue Issues gefunden. {stale} alte als stale markiert.")
+    print(f"Nutze --show-diagnostics {slug} für Details ({open_iss} aktuell offen).")
+
+
+def _print_issue(iss, show_all: bool = False):
+    status = iss.get("status")
+    if not show_all and status != "open":
+        return
+    
+    auto = "[auto-applicable]" if iss.get("auto_applicable") else ""
+    sev = iss.get("severity", "unknown").upper()
+    print(f"  {iss.get('id')}  [{sev}] {iss.get('kind')}           status: {status} {auto}")
+    print(f"           {iss.get('description')}")
+    if iss.get("sections_involved"):
+        print(f"           Betroffene Sektionen: {', '.join(iss.get('sections_involved'))}")
+    print()
+
+
+def cli_show_diagnostics(slug: str = None, show_all: bool = False):
+    if not slug:
+        diags = list_all_diagnostics()
+        open_pages = []
+        total_open = 0
+        for d in diags:
+            open_i = [i for i in d.get("issues", []) if i.get("status") == "open"]
+            if open_i or show_all:
+                open_pages.append((d, open_i))
+                total_open += len(open_i)
+                
+        print(f"📋 Diagnosen ({len(open_pages)} Seiten{' mit offnen Issues' if not show_all else ''}):\n")
+        for d, open_i in open_pages:
+            print(f"{d.get('kind')}s/{d.get('slug')}.md (analysiert {d.get('last_analyzed', 'unbekannt')[:16]}):")
+            issues_to_show = d.get("issues", []) if show_all else open_i
+            for iss in issues_to_show:
+                _print_issue(iss, show_all=True)
+    else:
+        slug = _sanitize_topic(slug)
+        diag = load_diagnostics(slug, "topic") or load_diagnostics(slug, "entity")
+        if not diag:
+            print(f"Keine Diagnose für '{slug}' gefunden.")
+            return
+            
+        print(f"📋 {diag.get('kind')}s/{diag.get('slug')}.md")
+        print(f"   Analysiert: {diag.get('last_analyzed', 'unbekannt')[:16]} (model: {diag.get('model_used', 'unknown')})")
+        print(f"   Content-Hash: {diag.get('content_hash', 'unknown')[:8]}...")
+        print()
+        for iss in diag.get("issues", []):
+            _print_issue(iss, show_all)
+
+
+def cli_apply_diagnostic(slug: str, issue_id: str, dry_run: bool):
+    slug = _sanitize_topic(slug)
+    # Check if exists
+    kind = "topic" if os.path.exists(_page_file_path(slug, "topic")) else "entity"
+    ok, msg = apply_issue(slug, kind, issue_id, dry_run)
+    if ok:
+        print(f"✓ Erfolg! {msg}")
+    else:
+        print(f"✗ Fehlschlag: {msg}")
+
+
+def cli_dismiss_diagnostic(slug: str, issue_id: str):
+    slug = _sanitize_topic(slug)
+    kind = "topic" if os.path.exists(_page_file_path(slug, "topic")) else "entity"
+    if set_issue_status(slug, kind, issue_id, "dismissed"):
+        print(f"✓ Issue {issue_id} in {slug} auf 'dismissed' gesetzt.")
+    else:
+        print(f"✗ Issue {issue_id} in {slug} nicht gefunden.")
 
 
 # ============================================================================
@@ -209,7 +259,31 @@ Beispiele:
     parser.add_argument(
         "--clean-semantic",
         metavar="SLUG",
-        help="LLM-Qualitätsanalyse für eine Seite (readonly, gibt JSON aus)",
+        help="LLM-Qualitätsanalyse für eine Seite",
+    )
+    parser.add_argument(
+        "--show-diagnostics",
+        nargs="?",
+        const="ALL",
+        metavar="SLUG",
+        help="Zeigt alle offenen Mängel an. SLUG für Details zu einer Seite.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Zusammen mit --show-diagnostics: zeigt auch dismissed/applied/stale Issues.",
+    )
+    parser.add_argument(
+        "--apply-diagnostic",
+        nargs=2,
+        metavar=("SLUG", "ID"),
+        help="Wendet einen Auto-Fix für eine Issue an (mit Backup).",
+    )
+    parser.add_argument(
+        "--dismiss-diagnostic",
+        nargs=2,
+        metavar=("SLUG", "ID"),
+        help="Setzt den Status einer Issue auf dismissed.",
     )
     args = parser.parse_args()
 
@@ -225,6 +299,19 @@ Beispiele:
         cli_clean_semantic(args.clean_semantic)
         return
 
+    if args.show_diagnostics is not None:
+        slug_arg = None if args.show_diagnostics == "ALL" else args.show_diagnostics
+        cli_show_diagnostics(slug_arg, args.all)
+        return
+
+    if args.apply_diagnostic:
+        cli_apply_diagnostic(args.apply_diagnostic[0], args.apply_diagnostic[1], args.dry_run)
+        return
+
+    if args.dismiss_diagnostic:
+        cli_dismiss_diagnostic(args.dismiss_diagnostic[0], args.dismiss_diagnostic[1])
+        return
+
     if args.refresh_entity:
         slug = _sanitize_topic(args.refresh_entity)
         if not slug:
@@ -234,3 +321,4 @@ Beispiele:
         sys.exit(0 if ok else 1)
 
     process_batch()
+
