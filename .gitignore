@@ -15,3 +15,5 @@ seen_urls.json
 config.json
 old_*.py
 __pycache__/
+.pytest_cache
+wiki_backups/
